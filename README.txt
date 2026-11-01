@@ -1,15 +1,13 @@
-ScrollSpeed v2 for Crimson Desert  (Ctrl + Mouse Wheel = PLAYER movement speed)
+ScrollSpeed v3 EXPERIMENT for Crimson Desert
 
-Only the controlled character's horizontal movement is scaled. Enemies, animations and
-the world clock stay at normal speed.
+Goal: change the game's own MoveSpeedRate data table live (what the "Movement Speed Gains" /
+"Direct Movement Speed" data mods change on disk), controlled by Ctrl + mouse wheel.
+UNVERIFIED: whether the game re-reads that table while running. The log tells us.
 
-INSTALL
- 1. Needs an x64 ASI loader (winmm.dll or version.dll) in  Crimson Desert\bin64\
- 2. Copy ScrollSpeed.asi and ScrollSpeed.ini into the same bin64 folder.
- 3. In game: hold Ctrl and scroll. Multiplier shows in the window title. Ctrl+Middle click = reset.
-
-TROUBLESHOOTING
- Set DebugLog=1 in the ini, relaunch, and read ScrollSpeed.log in bin64:
-   "hook installed"            -> working
-   "signature ... 0 match"     -> game updated; signature must be refreshed (send me the log + game version)
- Single-player only. Back up saves. Very high multipliers can clip through walls.
+TEST
+ 1. Copy ScrollSpeed.asi + ScrollSpeed.ini into bin64 (with your ASI loader). Remove older ScrollSpeed.asi.
+ 2. Start the game, LOAD A SAVE, wait for the auto-scan (~45 s) or press F6.
+ 3. Open ScrollSpeed.log (bin64) and read the lines starting "anchor at" and "scan done".
+ 4. Hold Ctrl and scroll up. Does your walk/run speed change? Try re-equipping an item or reloading
+    the save if not. F8 / Ctrl+middle-click restore the original values.
+ 5. Send me the whole log and what you saw.
