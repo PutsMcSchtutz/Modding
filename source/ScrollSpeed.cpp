@@ -1,74 +1,56 @@
-// ScrollSpeed v3 (EXPERIMENT) - Crimson Desert ASI plugin
-// Idea: the game's own walk/run speed gains come from the static data record "MoveSpeedRate"
-// (statusinfo). Community data-patch mods edit that record on disk. This plugin looks for that
-// record in the running game's memory and rewrites its 16 level entries live; the scroll wheel
-// changes the multiplier. WHETHER THE GAME RE-READS THE TABLE AT RUNTIME IS UNVERIFIED - the log
-// tells us. Nothing here is guaranteed to work; check ScrollSpeed.log.
-//
-// Record bytes below are taken from the "original" bytes in the Movement Speed Gains mod's patch
-// files (Steam build 25477059). Table layout (verified by the mod's own patched values being exact
-// multiples): record offset +89, 16 x int64, fixed-point 32.32.
-//
-// Keys: Modifier(Ctrl)+Wheel = change multiplier, Modifier+MiddleClick = reset (restores originals)
-//       F6 = rescan memory, F8 = restore originals.  Single-player only.
+// ScrollSpeed PROBE v4 - READ-ONLY diagnostic. Writes nothing to the game, installs no hooks.
+// Purpose: find out whether/how the game keeps the "MoveSpeedRate" speed table in memory.
+// It searches process memory (excluding this DLL itself) for:
+//   - the ASCII name "MoveSpeedRate"
+//   - the 16-entry table in several encodings (file format 32.32 fixed, int64, int32, float, double)
+// and logs every hit with module / region type / surrounding bytes into ScrollSpeed.log.
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <algorithm>
-#include <atomic>
-#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
 
-static const uint8_t kRec[246] = {
-    0x4B,0x42,0x0F,0x00,0x0D,0x00,0x00,0x00,0x4D,0x6F,0x76,0x65,0x53,0x70,0x65,0x65,
-    0x64,0x52,0x61,0x74,0x65,0x00,0x00,0x08,0x00,0x00,0x00,0x01,0x01,0x00,0x00,0x00,
-    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
-    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x03,0x0A,0x02,0x63,0x44,0x0F,0x00,0x00,
-    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x23,0xB2,0x25,0xAD,0xEF,0xCF,0x99,
-    0xDC,0x9D,0xB7,0xD3,0x61,0x00,0x01,0x00,0x10,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
-    0x00,0x00,0x00,0x00,0x00,0x2D,0x31,0x01,0x00,0x00,0x00,0x00,0x00,0x5A,0x62,0x02,
-    0x00,0x00,0x00,0x00,0x00,0x87,0x93,0x03,0x00,0x00,0x00,0x00,0x00,0xB4,0xC4,0x04,
-    0x00,0x00,0x00,0x00,0x00,0xE1,0xF5,0x05,0x00,0x00,0x00,0x00,0x00,0x0E,0x27,0x07,
-    0x00,0x00,0x00,0x00,0xC0,0xF8,0x48,0x08,0x00,0x00,0x00,0x00,0x40,0xA1,0x5B,0x09,
-    0x00,0x00,0x00,0x00,0x80,0x07,0x5F,0x0A,0x00,0x00,0x00,0x00,0x80,0x2B,0x53,0x0B,
-    0x00,0x00,0x00,0x00,0x00,0xCB,0x28,0x0C,0x00,0x00,0x00,0x00,0x40,0x28,0xEF,0x0C,
-    0x00,0x00,0x00,0x00,0x40,0x43,0xA6,0x0D,0x00,0x00,0x00,0x00,0x00,0x1C,0x4E,0x0E,
-    0x00,0x00,0x00,0x00,0x80,0xB2,0xE6,0x0E,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
-    0x00,0x00,0x00,0x00,0x00,0x00,0x41,0xDC,0x11,0xF3,0x23,0x87,0x8D,0x49,0x00,0x00,
-    0x00,0x00,0x00,0x00,0x00,0x00,
-};
-static const size_t kTblOff = 89, kHdrLen = 21;   // header = key(4) + nameLen(4) + "MoveSpeedRate"
-
-// ---------------- config ----------------
-static unsigned g_modVk = 0x11;
-static double g_step = 0.25, g_min = 0.25, g_max = 8.0, g_start = 1.0;
-static int g_flat = 1;                  // 1: set ALL 16 levels to (level-15 value * mult); 0: scale each level
-static DWORD g_initDelay = 45000;       // auto-scan this long after launch (also F6)
-static bool g_showTitle = true, g_log = true;
 static std::wstring g_dir;
-
-// ---------------- state ----------------
-struct Hit { uint8_t* rec; };
-static std::vector<Hit> g_hits;
-static double g_mult = 1.0;
-static CRITICAL_SECTION g_cs;
+static uint8_t* g_selfBase = nullptr; static size_t g_selfSize = 0;
+static FILE* g_f = nullptr;
 
 static void Log(const char* fmt, ...) {
-    if (!g_log) return;
-    std::wstring p = g_dir + L"ScrollSpeed.log";
-    FILE* f = _wfopen(p.c_str(), L"a");
-    if (!f) return;
-    va_list a; va_start(a, fmt); vfprintf(f, fmt, a); va_end(a);
-    fputc('\n', f); fclose(f);
+    if (!g_f) return;
+    va_list a; va_start(a, fmt); vfprintf(g_f, fmt, a); va_end(a);
+    fputc('\n', g_f); fflush(g_f);
 }
 
-// ---------------- memory scan ----------------
+struct Pat { std::string name; std::vector<uint8_t> b; };
+
+static void PushI64(std::vector<uint8_t>& v, int64_t x) { uint8_t t[8]; memcpy(t, &x, 8); v.insert(v.end(), t, t + 8); }
+static void PushI32(std::vector<uint8_t>& v, int32_t x) { uint8_t t[4]; memcpy(t, &x, 4); v.insert(v.end(), t, t + 4); }
+static void PushF32(std::vector<uint8_t>& v, float x) { uint8_t t[4]; memcpy(t, &x, 4); v.insert(v.end(), t, t + 4); }
+static void PushF64(std::vector<uint8_t>& v, double x) { uint8_t t[8]; memcpy(t, &x, 8); v.insert(v.end(), t, t + 8); }
+
+static std::vector<Pat> MakePats() {
+    // Original table entries (file format = value * 2^32 where value = 78125 * k for k=0..5, then flattening)
+    const int64_t fx[16] = { 0, 335544320000000LL, 671088640000000LL, 1006632960000000LL, 1342177280000000LL,
+        1677721600000000LL, 2013265920000000LL, 2332033024000000LL, 2634022912000000LL, 2919235584000000LL,
+        3187671040000000LL, 3422552064000000LL, 3640655872000000LL, 3841982464000000LL, 4026531840000000LL, 4194304000000000LL };
+    std::vector<Pat> P;
+    { Pat p{ "ascii MoveSpeedRate" }; const char* s = "MoveSpeedRate"; p.b.assign(s, s + 13); P.push_back(p); }
+    { Pat p{ "ascii MoveSpeedLevel" }; const char* s = "MoveSpeedLevel"; p.b.assign(s, s + 14); P.push_back(p); }
+    { Pat p{ "table 16x fixed32.32 (file format)" }; for (int i = 0; i < 16; i++) PushI64(p.b, fx[i]); P.push_back(p); }
+    { Pat p{ "first 5x fixed32.32" }; for (int i = 0; i < 5; i++) PushI64(p.b, fx[i]); P.push_back(p); }
+    { Pat p{ "first 6x int64 plain (0,78125,..)" }; for (int i = 0; i < 6; i++) PushI64(p.b, 78125LL * i); P.push_back(p); }
+    { Pat p{ "first 6x int32 plain" }; for (int i = 0; i < 6; i++) PushI32(p.b, (int32_t)(78125 * i)); P.push_back(p); }
+    { Pat p{ "first 6x float (0.078125*k)" }; for (int i = 0; i < 6; i++) PushF32(p.b, 0.078125f * i); P.push_back(p); }
+    { Pat p{ "first 6x double (0.078125*k)" }; for (int i = 0; i < 6; i++) PushF64(p.b, 0.078125 * i); P.push_back(p); }
+    { Pat p{ "first 6x float (78125*k)" }; for (int i = 0; i < 6; i++) PushF32(p.b, 78125.0f * i); P.push_back(p); }
+    { Pat p{ "first 6x double (78125*k)" }; for (int i = 0; i < 6; i++) PushF64(p.b, 78125.0 * i); P.push_back(p); }
+    return P;
+}
+
 static bool Readable(const MEMORY_BASIC_INFORMATION& m) {
     if (m.State != MEM_COMMIT || (m.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return false;
     DWORD p = m.Protect & 0xFF;
@@ -76,129 +58,71 @@ static bool Readable(const MEMORY_BASIC_INFORMATION& m) {
            p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY;
 }
 
+static void DescribeAndDump(const uint8_t* hit, const MEMORY_BASIC_INFORMATION& m, const uint8_t* regBase, size_t regSize) {
+    char mod[MAX_PATH] = "-";
+    HMODULE hm = nullptr;
+    if (m.Type == MEM_IMAGE && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)hit, &hm))
+        GetModuleFileNameA(hm, mod, MAX_PATH);
+    const uint8_t* s = std::max(hit - 16, regBase);
+    const uint8_t* e = std::min(hit + 80, regBase + regSize);
+    std::string hex; char t[4];
+    for (const uint8_t* p = s; p < e; p++) { snprintf(t, 4, "%02x", *p); hex += t; if (p == hit - 1) hex += " | "; }
+    Log("    at %p  type=0x%lX prot=0x%lX module=%s", (void*)hit, m.Type, m.Protect, mod);
+    Log("    bytes(-16..+80): %s", hex.c_str());
+}
+
 static void Scan() {
-    EnterCriticalSection(&g_cs);
-    g_hits.clear();
-    uint8_t* a = nullptr; size_t regions = 0, bytes = 0, anchors = 0;
+    std::vector<Pat> P = MakePats();
+    std::vector<int> counts(P.size(), 0);
+    Log("=== scan start ===");
+    uint8_t* a = nullptr; size_t regions = 0, bytes = 0;
     MEMORY_BASIC_INFORMATION m;
     while (VirtualQuery(a, &m, sizeof(m)) == sizeof(m)) {
         uint8_t* base = (uint8_t*)m.BaseAddress; size_t sz = m.RegionSize;
         a = base + sz;
-        if (!Readable(m) || sz < sizeof(kRec)) continue;
+        if (!Readable(m)) continue;
+        if (base < g_selfBase + g_selfSize && base + sz > g_selfBase) continue;   // skip our own DLL
         regions++; bytes += sz;
-        const uint8_t* p = base; const uint8_t* end = base + sz - kHdrLen;
-        while (p < end) {
-            p = (const uint8_t*)memchr(p, 0x4B, end - p);
-            if (!p) break;
-            if (memcmp(p, kRec, kHdrLen) == 0) {
-                anchors++;
-                size_t same = 0, n = std::min<size_t>(sizeof(kRec), (size_t)(base + sz - p));
-                for (size_t i = 0; i < n; i++) same += (p[i] == kRec[i]);
-                bool tbl = (size_t)(base + sz - p) >= kTblOff + 128 && memcmp(p + kTblOff, kRec + kTblOff, 128) == 0;
-                Log("anchor at %p: %zu/%zu record bytes identical, table %s, region type=0x%lX prot=0x%lX",
-                    (void*)p, same, sizeof(kRec), tbl ? "ORIGINAL" : "differs", m.Type, m.Protect);
-                if (tbl) g_hits.push_back({ (uint8_t*)p });
+        for (size_t pi = 0; pi < P.size(); pi++) {
+            const auto& pat = P[pi].b;
+            if (sz < pat.size()) continue;
+            const uint8_t* p = base; const uint8_t* end = base + sz - pat.size() + 1;
+            while (p < end) {
+                p = (const uint8_t*)memchr(p, pat[0], end - p);
+                if (!p) break;
+                if (memcmp(p, pat.data(), pat.size()) == 0) {
+                    if (++counts[pi] <= 12) { Log("HIT [%s] #%d", P[pi].name.c_str(), counts[pi]); DescribeAndDump(p, m, base, sz); }
+                }
+                p++;
             }
-            p++;
         }
     }
-    Log("scan done: %zu regions, %.1f MB, %zu anchor(s), %zu usable table(s)", regions, bytes / 1048576.0, anchors, g_hits.size());
-    LeaveCriticalSection(&g_cs);
-}
-
-// ---------------- apply ----------------
-static void Apply() {
-    EnterCriticalSection(&g_cs);
-    for (auto& h : g_hits) {
-        int64_t out[16]; const uint8_t* orig = kRec + kTblOff; int64_t o15; memcpy(&o15, orig + 15 * 8, 8);
-        for (int k = 0; k < 16; k++) {
-            int64_t o; memcpy(&o, orig + k * 8, 8);
-            double base = (g_flat && g_mult != 1.0) ? (double)o15 : (double)o;
-            out[k] = (g_mult == 1.0) ? o : (int64_t)(base * g_mult);
-        }
-        DWORD old;
-        if (VirtualProtect(h.rec + kTblOff, 128, PAGE_READWRITE, &old)) {
-            memcpy(h.rec + kTblOff, out, 128);
-            VirtualProtect(h.rec + kTblOff, 128, old, &old);
-        } else Log("VirtualProtect failed at %p", (void*)h.rec);
-    }
-    Log("applied multiplier %.2f (%s) to %zu table(s)", g_mult, g_flat ? "flat" : "scale", g_hits.size());
-    LeaveCriticalSection(&g_cs);
-}
-
-// ---------------- title / input ----------------
-static BOOL CALLBACK FindWnd(HWND h, LPARAM lp) {
-    DWORD pid; GetWindowThreadProcessId(h, &pid);
-    if (pid == GetCurrentProcessId() && IsWindowVisible(h) && !GetWindow(h, GW_OWNER)) { *(HWND*)lp = h; return FALSE; }
-    return TRUE;
-}
-static void ShowSpeed() {
-    if (!g_showTitle) return;
-    static HWND wnd = nullptr; static wchar_t orig[256] = L"";
-    if (!wnd || !IsWindow(wnd)) { wnd = nullptr; EnumWindows(FindWnd, (LPARAM)&wnd); if (wnd) GetWindowTextW(wnd, orig, 256); }
-    if (!wnd) return;
-    wchar_t buf[320];
-    if (g_mult == 1.0) swprintf(buf, 320, L"%ls", orig);
-    else swprintf(buf, 320, L"%ls   [MoveSpeedRate x%.2f, %zu table(s)]", orig, g_mult, g_hits.size());
-    SetWindowTextW(wnd, buf);
-}
-static bool GameFocused() {
-    HWND fg = GetForegroundWindow(); DWORD pid = 0;
-    if (fg) GetWindowThreadProcessId(fg, &pid);
-    return pid == GetCurrentProcessId();
-}
-static bool ModDown() { return g_modVk == 0 || (GetAsyncKeyState((int)g_modVk) & 0x8000); }
-static void SetMult(double v) { g_mult = std::min(g_max, std::max(g_min, std::round(v * 100.0) / 100.0)); Apply(); ShowSpeed(); }
-
-static LRESULT CALLBACK MouseProc(int code, WPARAM wp, LPARAM lp) {
-    if (code == HC_ACTION && GameFocused() && ModDown()) {
-        auto* ms = (MSLLHOOKSTRUCT*)lp;
-        if (wp == WM_MOUSEWHEEL) {
-            short d = (short)((ms->mouseData >> 16) & 0xFFFF);
-            SetMult(g_mult + (d / (double)WHEEL_DELTA) * g_step);
-            return 1;
-        }
-        if (wp == WM_MBUTTONDOWN) { SetMult(1.0); return 1; }
-        if (wp == WM_MBUTTONUP) return 1;
-    }
-    return CallNextHookEx(nullptr, code, wp, lp);
-}
-
-static void LoadConfig() {
-    std::wstring ini = g_dir + L"ScrollSpeed.ini";
-    wchar_t b[64];
-    auto rd = [&](const wchar_t* k, const wchar_t* d) { GetPrivateProfileStringW(L"Settings", k, d, b, 64, ini.c_str()); return std::wstring(b); };
-    g_modVk = wcstoul(rd(L"Modifier", L"11").c_str(), nullptr, 16);
-    g_step = _wtof(rd(L"Step", L"0.25").c_str());
-    g_min = _wtof(rd(L"Min", L"0.25").c_str());
-    g_max = _wtof(rd(L"Max", L"8.0").c_str());
-    g_start = _wtof(rd(L"Start", L"1.0").c_str());
-    g_flat = _wtoi(rd(L"Flat", L"1").c_str());
-    g_initDelay = (DWORD)_wtoi(rd(L"ScanDelayMs", L"45000").c_str());
-    g_showTitle = _wtoi(rd(L"ShowInTitle", L"1").c_str()) != 0;
-    g_log = _wtoi(rd(L"DebugLog", L"1").c_str()) != 0;
+    Log("=== scan done: %zu regions, %.1f MB (own DLL excluded) ===", regions, bytes / 1048576.0);
+    for (size_t i = 0; i < P.size(); i++) Log("  total hits [%s]: %d", P[i].name.c_str(), counts[i]);
 }
 
 static DWORD WINAPI Init(LPVOID hMod) {
-    InitializeCriticalSection(&g_cs);
+    HANDLE mtx = CreateMutexW(nullptr, TRUE, L"Local\\ScrollSpeedProbeV4");
+    if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;       // loaded twice -> second copy exits
     wchar_t path[MAX_PATH]; GetModuleFileNameW((HMODULE)hMod, path, MAX_PATH);
     g_dir = path; g_dir = g_dir.substr(0, g_dir.find_last_of(L"\\/") + 1);
-    LoadConfig();
-    Log("ScrollSpeed v3 experiment starting");
-    HHOOK h = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, GetModuleHandleW(nullptr), 0);
-    Log(h ? "mouse hook installed" : "mouse hook FAILED");
+    g_selfBase = (uint8_t*)hMod;
+    auto* nt = (IMAGE_NT_HEADERS*)(g_selfBase + ((IMAGE_DOS_HEADER*)g_selfBase)->e_lfanew);
+    g_selfSize = nt->OptionalHeader.SizeOfImage;
+    g_f = _wfopen((g_dir + L"ScrollSpeedProbe.log").c_str(), L"w");
+    Log("ScrollSpeed PROBE v4 (read-only). own DLL %p size %zu", (void*)g_selfBase, g_selfSize);
 
-    ULONGLONG t0 = GetTickCount64(); bool scanned = false, f6 = false, f8 = false;
-    for (;;) {
-        MSG m; while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageW(&m); }
-        if (!scanned && GetTickCount64() - t0 > g_initDelay) {
-            scanned = true; Scan(); if (g_start != 1.0) { g_mult = g_start; Apply(); ShowSpeed(); }
-        }
-        bool k6 = GameFocused() && (GetAsyncKeyState(VK_F6) & 0x8000), k8 = GameFocused() && (GetAsyncKeyState(VK_F8) & 0x8000);
-        if (k6 && !f6) { Scan(); Apply(); ShowSpeed(); }
-        if (k8 && !f8) { g_mult = 1.0; Apply(); ShowSpeed(); }
-        f6 = k6; f8 = k8;
-        Sleep(15);
+    std::wstring ini = g_dir + L"ScrollSpeed.ini";
+    DWORD delay = GetPrivateProfileIntW(L"Settings", L"ScanDelayMs", 60000, ini.c_str());
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    Sleep(delay);                   // load a save before this elapses
+    Scan();                         // automatic scan once
+    bool f6 = false;
+    for (;;) {                      // press F6 (game focused) to scan again, e.g. after changing something
+        HWND fg = GetForegroundWindow(); DWORD pid = 0; if (fg) GetWindowThreadProcessId(fg, &pid);
+        bool k = pid == GetCurrentProcessId() && (GetAsyncKeyState(VK_F6) & 0x8000);
+        if (k && !f6) Scan();
+        f6 = k; Sleep(50);
     }
 }
 
