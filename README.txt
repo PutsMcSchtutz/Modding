@@ -1,13 +1,15 @@
-ScrollSpeed for Crimson Desert  (Ctrl + Mouse Wheel = game speed)
+ScrollSpeed v2 for Crimson Desert  (Ctrl + Mouse Wheel = PLAYER movement speed)
 
-BUILD (no PC setup needed):
- 1. Create a free GitHub repo, upload this whole folder (keep .github/ intact).
- 2. Open the Actions tab -> "build" -> download the ScrollSpeed artifact (contains ScrollSpeed.asi + .ini).
- Or locally (Visual Studio 2022):  cmake -B build -A x64 && cmake --build build --config Release
+Only the controlled character's horizontal movement is scaled. Enemies, animations and
+the world clock stay at normal speed.
 
-INSTALL:
- 1. Put an x64 Ultimate ASI Loader (as winmm.dll or version.dll) in  Crimson Desert\bin64\
+INSTALL
+ 1. Needs an x64 ASI loader (winmm.dll or version.dll) in  Crimson Desert\bin64\
  2. Copy ScrollSpeed.asi and ScrollSpeed.ini into the same bin64 folder.
- 3. In game: hold Ctrl and scroll. Speed shows in the window title. Ctrl+Middle click resets to 1x.
+ 3. In game: hold Ctrl and scroll. Multiplier shows in the window title. Ctrl+Middle click = reset.
 
-LIMITS: scales the whole game clock (enemies/animations too), not just Kliff's movement.
+TROUBLESHOOTING
+ Set DebugLog=1 in the ini, relaunch, and read ScrollSpeed.log in bin64:
+   "hook installed"            -> working
+   "signature ... 0 match"     -> game updated; signature must be refreshed (send me the log + game version)
+ Single-player only. Back up saves. Very high multipliers can clip through walls.
