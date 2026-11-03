@@ -1,6 +1,7 @@
-// ScrollSpeed keyboard/mouse-only - Crimson Desert ASI plugin
-// Keyboard/mouse-only build: native keyboard movement + game-side movement-vector scaling.
-// All XInput interception and physical-controller processing have been removed.
+// ScrollSpeed v7 - Crimson Desert ASI plugin
+// Clean rebuild: native keyboard movement + game-side movement-vector scaling.
+// No virtual XInput device is created, so keyboard/mouse prompts remain the game's native choice.
+// A real XInput controller is still supported and scaled through XInputGetState.
 //
 // The keyboard movement hook is based on the user's Cheat Engine table, entry 45 ("walk key"):
 //   CrimsonDesert.exe+81EAF9
@@ -23,6 +24,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <MinHook.h>
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -33,15 +35,26 @@
 #include <cstring>
 #include <string>
 
+// Minimal XInput types (identical layout to xinput.h)
+struct XPad { WORD wButtons; BYTE bLeftTrigger, bRightTrigger; SHORT sThumbLX, sThumbLY, sThumbRX, sThumbRY; };
+struct XState { DWORD dwPacketNumber; XPad Gamepad; };
+typedef DWORD(WINAPI* GetState_t)(DWORD, XState*);
+static const WORD BTN_UP = 0x0001, BTN_DOWN = 0x0002, BTN_BACK = 0x0020;
+static const WORD BTN_LB = 0x0100, BTN_RB = 0x0200;
+#ifndef ERROR_DEVICE_NOT_CONNECTED
+#define ERROR_DEVICE_NOT_CONNECTED 1167L
+#endif
+
 // ---------------- config ----------------
 static unsigned g_modVk = 0x11;               // Ctrl; 0 = wheel always adjusts
 static unsigned g_toggleVk = 0x91;            // Scroll Lock toggles keyboard vector scaling; 0 = none
 static float g_step = 0.05f, g_min = 0.10f, g_start = 0.80f;
-static bool g_showTitle = true, g_log = true;
+static float g_deadZone = 7849.0f;             // XInput default left-stick dead zone
+static bool g_padAdjust = true, g_showTitle = true, g_log = true;
 static bool g_keyboardVectorEnabled = true;
 static std::wstring g_dir;
 
-static std::atomic<float> g_limit{1.0f};       // native WASD movement-vector multiplier
+static std::atomic<float> g_limit{1.0f};       // native WASD vector multiplier / controller stick limit
 static std::atomic<float> g_combatLimit{0.30f};
 static std::atomic<bool> g_dirty{false};
 static std::atomic<bool> g_keyboardScaleEnabled{true};
@@ -69,6 +82,9 @@ static bool g_enabled = true, g_wheelEnabled = true, g_baseSpeedEnabled = true, 
 static bool g_debugKeys = false;
 static std::atomic<bool> g_runLatch{false};
 static std::atomic<ULONGLONG> g_lastShift{0};
+static std::atomic<ULONGLONG> g_realPadTick{0};
+static std::atomic<long> g_calls{0}, g_scaled{0};
+static GetState_t g_origA = nullptr, g_origEx = nullptr;
 static FILE* g_f = nullptr;
 static bool g_movementVectorHookInstalled = false;
 static BYTE* g_movementVectorSite = nullptr;
@@ -183,6 +199,63 @@ static void AdjustLimit(float delta) {
     g_dirty.store(true);
     RefreshKeyboardVectorScale();
 }
+
+static float StickFactor(float lim) {
+    // XInput path only: preserve the game's dead zone while reducing the stick's effective range.
+    return (g_deadZone + lim * (32767.0f - g_deadZone)) / 32767.0f;
+}
+
+// ---------------- XInput: physical controllers only ----------------
+static void ProcessReal(XState* s) {
+    static WORD prev = 0;
+    const WORD b = s->Gamepad.wButtons;
+    if (g_padAdjust && (b & BTN_BACK)) {
+        const WORD pressed = b & ~prev;
+        if (pressed & BTN_UP) AdjustLimit(+g_step);
+        if (pressed & BTN_DOWN) AdjustLimit(-g_step);
+        s->Gamepad.wButtons &= ~(BTN_UP | BTN_DOWN);
+    }
+    if ((b & (BTN_LB | BTN_RB)) || s->Gamepad.bRightTrigger > 40 || s->Gamepad.bLeftTrigger > 40)
+        MarkCombat(); // LB=guard, RB=attack, LT/RT=attack/ability in the default controller layout
+    prev = b;
+
+    const float lim = ActiveLimit();
+    if (lim < 0.999f) {
+        const float x = (float)s->Gamepad.sThumbLX;
+        const float y = (float)s->Gamepad.sThumbLY;
+        const float magnitude = std::sqrt(x * x + y * y);
+        if (magnitude > g_deadZone) {
+            const float factor = StickFactor(lim);
+            s->Gamepad.sThumbLX = (SHORT)(x * factor);
+            s->Gamepad.sThumbLY = (SHORT)(y * factor);
+            g_scaled++;
+        }
+    }
+
+    // Pad A held while moving = running; clear after a brief stop.
+    static ULONGLONG lastMove = 0;
+    const float x = (float)s->Gamepad.sThumbLX, y = (float)s->Gamepad.sThumbLY;
+    const ULONGLONG now = GetTickCount64();
+    if (std::sqrt(x * x + y * y) > g_deadZone) {
+        lastMove = now;
+        if (b & 0x1000) g_runLatch.store(true);
+    } else if (now - lastMove > 200 && now - g_lastShift.load() > 1000) {
+        g_runLatch.store(false);
+    }
+}
+
+static DWORD DoGetState(GetState_t orig, DWORD i, XState* s) {
+    g_calls++;
+    const DWORD result = orig(i, s);
+    if (!s || result != ERROR_SUCCESS) return result;
+    if (i == 0) {
+        g_realPadTick.store(GetTickCount64(), std::memory_order_relaxed);
+        ProcessReal(s);
+    }
+    return result;
+}
+static DWORD WINAPI HookA(DWORD i, XState* s) { return DoGetState(g_origA, i, s); }
+static DWORD WINAPI HookEx(DWORD i, XState* s) { return DoGetState(g_origEx, i, s); }
 
 // ---------------- game-side movement vector hook ----------------
 static BYTE* FindUniqueMovementVectorSite(HMODULE module, int* matchCount) {
@@ -537,6 +610,8 @@ static void LoadConfig() {
     g_step = (float)_wtof(read(L"Step", L"0.05").c_str());
     g_min = (float)_wtof(read(L"Min", L"0.10").c_str());
     g_start = (float)_wtof(read(L"Start", L"0.80").c_str());
+    g_deadZone = (float)_wtof(read(L"DeadZone", L"7849").c_str());
+    g_padAdjust = _wtoi(read(L"PadAdjust", L"1").c_str()) != 0;
     g_keyboardVectorEnabled = _wtoi(read(L"KeyboardVector", L"1").c_str()) != 0;
     g_showTitle = _wtoi(read(L"ShowInTitle", L"1").c_str()) != 0;
     g_log = _wtoi(read(L"DebugLog", L"1").c_str()) != 0;
@@ -548,8 +623,18 @@ static void LoadConfig() {
     g_debugKeys = _wtoi(read(L"DebugKeys", L"0").c_str()) != 0;
 }
 
+static bool Hook(void* target, void* detour, void** original, const char* name, const wchar_t* dll) {
+    if (!target) return false;
+    if (MH_CreateHook(target, detour, original) != MH_OK || MH_EnableHook(target) != MH_OK) {
+        Log("hook %s FAILED", name);
+        return false;
+    }
+    Log("hooked %s in %ls", name, dll);
+    return true;
+}
+
 static DWORD WINAPI Init(LPVOID moduleHandle) {
-    CreateMutexW(nullptr, TRUE, L"Local\\ScrollSpeedKeyboardMouseOnly");
+    CreateMutexW(nullptr, TRUE, L"Local\\ScrollSpeedV7");
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 
     wchar_t path[MAX_PATH];
@@ -558,7 +643,7 @@ static DWORD WINAPI Init(LPVOID moduleHandle) {
     g_dir = g_dir.substr(0, g_dir.find_last_of(L"\\/") + 1);
     LoadConfig();
     g_f = _wfopen((g_dir + L"ScrollSpeed.log").c_str(), L"w");
-    Log("ScrollSpeed keyboard/mouse-only starting (enabled=%d wheel=%d keyboardVector=%d combatBinary=%d start=%.2f)",
+    Log("ScrollSpeed v7 clean starting (enabled=%d wheel=%d keyboardVector=%d combatBinary=%d start=%.2f)",
         (int)g_enabled, (int)g_wheelEnabled, (int)g_keyboardVectorEnabled, (int)g_combatBinary, g_start);
     if (!g_enabled) {
         Log("Enabled=0 -> mod does nothing");
@@ -571,14 +656,38 @@ static DWORD WINAPI Init(LPVOID moduleHandle) {
     RefreshKeyboardVectorScale();
     CreateThread(nullptr, 0, InputThread, nullptr, 0, nullptr);
 
-    // Install only the game-side movement-vector hook; this build has no controller hooks.
+    if (MH_Initialize() != MH_OK) {
+        Log("MH_Initialize failed");
+        return 0;
+    }
+
+    // Hook the game's movement vector only for native WASD scaling. It does not create a virtual pad.
     InstallMovementVectorHook();
 
-    ULONGLONG lastStats = GetTickCount64();
+    const wchar_t* dlls[] = { L"xinput1_4.dll", L"xinput1_3.dll", L"xinput9_1_0.dll" };
+    bool xinputHooked = false;
+    const ULONGLONG startTime = GetTickCount64();
+    ULONGLONG lastStats = startTime;
+    long previousCalls = 0, previousScaled = 0;
     bool previousCombat = false;
     bool previousWeaponOut = false;
 
     for (;;) {
+        if (!xinputHooked && GetTickCount64() - startTime < 600000) {
+            for (const wchar_t* dll : dlls) {
+                HMODULE xinput = GetModuleHandleW(dll);
+                if (!xinput) continue;
+                void* getState = (void*)GetProcAddress(xinput, "XInputGetState");
+                void* getStateEx = (void*)GetProcAddress(xinput, MAKEINTRESOURCEA(100));
+                if (Hook(getState, (void*)HookA, (void**)&g_origA, "XInputGetState", dll)) {
+                    xinputHooked = true;
+                    if (getStateEx && getStateEx != getState)
+                        Hook(getStateEx, (void*)HookEx, (void**)&g_origEx, "XInputGetStateEx", dll);
+                    break;
+                }
+            }
+        }
+
         const bool currentCombat = InCombat();
         const bool currentWeaponOut = g_weaponOut.load();
         if (currentCombat != previousCombat || currentWeaponOut != previousWeaponOut) {
@@ -593,10 +702,14 @@ static DWORD WINAPI Init(LPVOID moduleHandle) {
         if (g_dirty.exchange(false) && g_showTitle) UpdateTitle();
 
         if (GetTickCount64() - lastStats > 10000) {
-            Log("[10s] vectorHook=%d vectorScale=%.2f WASD=%d%d%d%d weaponOut=%d combat=%d",
+            const long calls = g_calls.load(), scaled = g_scaled.load();
+            Log("[10s] XInput calls=%ld scaled=%ld hooked=%d vectorHook=%d vectorScale=%.2f WASD=%d%d%d%d weaponOut=%d combat=%d",
+                calls - previousCalls, scaled - previousScaled, (int)xinputHooked,
                 (int)g_movementVectorHookInstalled, g_keyboardVectorScale.load(),
                 (int)g_key[0].load(), (int)g_key[1].load(), (int)g_key[2].load(), (int)g_key[3].load(),
                 (int)g_weaponOut.load(), (int)InCombat());
+            previousCalls = calls;
+            previousScaled = scaled;
             lastStats = GetTickCount64();
         }
         Sleep(200);
